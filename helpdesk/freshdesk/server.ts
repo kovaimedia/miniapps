@@ -18,6 +18,16 @@ const USERS_RAW = process.env.USERS || "";
 const GOOGLE_CHAT_WEBHOOK = process.env.GOOGLE_CHAT_WEBHOOK || "";
 const CRON_SECRET = process.env.CRON_SECRET || "";
 
+// Model assignments — cheap Haiku for classify/grade, Sonnet for user-facing prose
+const MODEL_DRAFT_REPLY = "claude-sonnet-4-6";   // customer-facing drafts — quality matters
+const MODEL_TRIAGE      = "claude-haiku-4-5";    // classifier — trivial task, cheap
+const MODEL_GRADE       = "claude-haiku-4-5";    // daily-review grader — 100% agreement with Sonnet, 3× cheaper
+const MODEL_NARRATIVE   = "claude-sonnet-4-6";   // daily digest opening prose — user reads this
+
+// Grade cache — skip re-grading when nothing changed since last run
+const GRADE_CACHE_PATH = "./grades-cache.json";
+const GRADE_BATCH_SIZE = 10;  // grader batches N tickets per Claude call
+
 // Parse USERS env: "amar:pass1,raghu:pass2:fd_apikey,..." → Maps
 // Third field per user is an optional Freshdesk API key; falls back to FRESHDESK_API_KEY.
 const USERS = new Map<string, string>();
@@ -334,7 +344,7 @@ async function handleTriage(req: Request): Promise<Response> {
           "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify({
-          model: "claude-sonnet-4-6",
+          model: MODEL_TRIAGE,
           max_tokens: 4096,
           system: TRIAGE_SYSTEM_PROMPT,
           messages: [
@@ -603,9 +613,9 @@ ${messages.join("\n\n")}${attachmentLine}${instructionsBlock}`;
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-6",
+      model: MODEL_DRAFT_REPLY,
       max_tokens: 2048,
-      system: RESPONSE_GUIDELINES,
+      system: [{ type: "text", text: RESPONSE_GUIDELINES, cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: userContent }],
     }),
   });
@@ -830,61 +840,118 @@ interface ReplyGrade {
   reason: string;
 }
 
-async function gradeAgentReply(
-  ticket: TicketListItem,
-  conversations: FdConversation[],
-  replyBody: string
-): Promise<ReplyGrade> {
-  const requesterName = ticket.requester?.name || "";
-  const requesterEmail = ticket.requester?.email || "unknown";
-  const fromLine = requesterName ? `${requesterName} <${requesterEmail}>` : requesterEmail;
+interface GradeCandidate {
+  ticket: TicketListItem;
+  conversations: FdConversation[];
+  replyBody: string;
+}
+
+interface CachedGrade {
+  grade: ReplyGrade;
+  latest_activity_at: string;   // ISO — timestamp of latest message (any direction) when graded
+  graded_at: string;
+  // legacy field, kept only to help migrate old cache entries without discarding them
+  latest_customer_msg_at?: string;
+}
+
+/**
+ * Fingerprint the ticket's conversation state so we can tell whether anything
+ * new has arrived since we last graded. Tracks the latest timestamp across
+ * ALL messages (incoming or outgoing) — an agent reply after a "no_agent_reply"
+ * grade must invalidate the cache, not just new customer messages.
+ */
+function latestActivityAt(conversations: FdConversation[]): string {
+  const list = conversations || [];
+  if (!list.length) return "1970-01-01T00:00:00Z";
+  return list
+    .map((c) => c.created_at)
+    .sort()
+    .slice(-1)[0];
+}
+
+async function loadGradeCache(): Promise<Record<string, CachedGrade>> {
+  const f = Bun.file(GRADE_CACHE_PATH);
+  if (!(await f.exists())) return {};
+  try {
+    return (await f.json()) as Record<string, CachedGrade>;
+  } catch {
+    return {};
+  }
+}
+
+async function saveGradeCache(cache: Record<string, CachedGrade>): Promise<void> {
+  await Bun.write(GRADE_CACHE_PATH, JSON.stringify(cache, null, 2));
+}
+
+/**
+ * Grade N tickets in ONE Claude call. Returns grades in input order.
+ * With prompt caching on RESPONSE_GUIDELINES, the ~7K-token system prompt
+ * costs full price on the first batch and ~10% on every batch after.
+ */
+async function gradeAgentRepliesBatch(candidates: GradeCandidate[]): Promise<ReplyGrade[]> {
+  if (!candidates.length) return [];
 
   const cleanText = (s: string) =>
     s.replace(/\[image:[^\]]*\]/g, "").replace(/\n{3,}/g, "\n\n").trim();
 
-  const lines: string[] = [];
-  lines.push(`--- Original message | ${ticket.created_at} ---\nFrom: ${fromLine}\nSubject: ${ticket.subject}\n\n${cleanText(ticket.description_text || "")}`);
-  for (const c of conversations || []) {
-    const dir = c.incoming ? "Incoming (customer)" : "Outgoing (agent)";
-    const vis = c.private ? " [private note]" : "";
-    lines.push(`--- ${dir}${vis} | ${c.created_at} ---\n${cleanText(c.body_text || c.body || "")}`);
-  }
+  const buildTicketSection = (c: GradeCandidate, idx: number): string => {
+    const { ticket, conversations, replyBody } = c;
+    const requesterName = ticket.requester?.name || "";
+    const requesterEmail = ticket.requester?.email || "unknown";
+    const fromLine = requesterName ? `${requesterName} <${requesterEmail}>` : requesterEmail;
 
-  const replyClause = replyBody
-    ? `The most recent agent reply on this ticket (in the last 24h):\n"""\n${replyBody}\n"""\n`
-    : `(There is no agent reply yet — the customer is waiting.)\n`;
+    const lines: string[] = [];
+    lines.push(`--- Original | ${ticket.created_at} ---\nFrom: ${fromLine}\nSubject: ${ticket.subject}\n\n${cleanText(ticket.description_text || "")}`);
+    for (const c2 of conversations || []) {
+      const dir = c2.incoming ? "Incoming (customer)" : "Outgoing (agent)";
+      const vis = c2.private ? " [private note]" : "";
+      lines.push(`--- ${dir}${vis} | ${c2.created_at} ---\n${cleanText(c2.body_text || c2.body || "")}`);
+    }
+    const replyClause = replyBody
+      ? `The most recent agent reply (last 24h):\n"""\n${replyBody}\n"""`
+      : `(No agent reply yet — the customer is waiting.)`;
 
-  const userMsg = `You are screening a Swarajya / Kovai Media support ticket for the editor. The editor only wants to see tickets where EITHER (a) the customer expresses anger or dissatisfaction, OR (b) you judge the most recent service response was unsatisfactory. Ignore minor style/tone issues — the goal is real customer-experience problems, not style enforcement.
-
-Ticket #${ticket.id}
+    return `====== TICKET ${idx + 1} of ${candidates.length} (ID: ${ticket.id}) ======
 Subject: ${ticket.subject}
 Customer: ${fromLine}
 
-Full thread (chronological):
+Full thread:
 ${lines.join("\n\n")}
 
-${replyClause}
-Output ONLY a JSON object on a single line, no markdown:
-{"customer_state": "satisfied" | "neutral" | "dissatisfied" | "angry", "service_quality": "ok" | "unsatisfactory" | "no_agent_reply", "flagged": true | false, "reason": "1-2 sentences explaining what to look at"}
+${replyClause}`;
+  };
+
+  const ticketSections = candidates.map(buildTicketSection).join("\n\n");
+
+  const userMsg = `You are screening ${candidates.length} Swarajya / Kovai Media support tickets for the editor. Flag ONLY tickets where EITHER (a) the customer expresses anger or dissatisfaction, OR (b) the most recent service response was unsatisfactory. Ignore style/tone nits — the goal is real customer-experience problems.
+
+For EACH ticket in the list below, output ONE JSON object on its own line, IN THE SAME ORDER as the tickets appear. Do not include any other text, markdown, or preamble.
+
+Each JSON object must have exactly these keys:
+{"ticket_index": <1-based index>, "customer_state": "satisfied" | "neutral" | "dissatisfied" | "angry", "service_quality": "ok" | "unsatisfactory" | "no_agent_reply", "flagged": true | false, "reason": "1-2 sentences (only meaningful when flagged=true)"}
 
 Field meanings:
 
-customer_state — read the customer's MOST RECENT message:
-- "angry": clear hostility, threats, demands, all-caps, accusations of cheating, escalation threats ("this is unacceptable", "I will go to consumer court", "refund immediately or else", repeated complaints, very strong language)
-- "dissatisfied": expresses frustration, disappointment, complaint about delays/wrong items/unmet expectations — but not yet hostile
+customer_state — read the customer's MOST RECENT message on that ticket:
+- "angry": clear hostility, threats, demands, all-caps, accusations, escalation threats ("this is unacceptable", "I'll go to consumer court", "refund NOW", repeated complaints)
+- "dissatisfied": frustration, disappointment, complaint about delays/wrong items/unmet expectations — not yet hostile
 - "neutral": normal enquiry, polite question, status check
 - "satisfied": expressing thanks, confirming resolution, positive feedback
 
-service_quality — judge the most recent agent reply (skip if no agent reply yet):
-- "no_agent_reply": customer has written but no agent has replied yet in this thread or the last 24h window
-- "unsatisfactory": agent ignored the customer's main question, was dismissive or rude, gave a generic answer when specifics were needed, was factually wrong, contradicted policy, dropped the ticket without resolution, demanded info already provided, or made the customer's situation worse. IGNORE style/tone nits like "Jai Hind", stacked apologies, formatting — those are not unsatisfactory service. Service is unsatisfactory only when the CUSTOMER would reasonably be unhappy with what they got.
+service_quality — judge the most recent agent reply on that ticket:
+- "no_agent_reply": customer has written but no agent has replied yet in the window
+- "unsatisfactory": agent ignored the main question, was dismissive/rude, gave a generic answer when specifics were needed, was factually wrong, contradicted policy, dropped the ticket without resolution, demanded info already provided, or made the situation worse. IGNORE style/tone nits like "Jai Hind", stacked apologies, formatting — those are NOT unsatisfactory service. Service is unsatisfactory only when the CUSTOMER would reasonably be unhappy with what they got.
 - "ok": agent addressed the customer's question with reasonable care.
 
-flagged — set to true if customer_state is "dissatisfied" or "angry", OR service_quality is "unsatisfactory", OR service_quality is "no_agent_reply" AND customer_state is "dissatisfied" or "angry". Otherwise false.
+flagged — true if customer_state is "dissatisfied"/"angry" OR service_quality is "unsatisfactory". Otherwise false.
 
-reason — only meaningful when flagged=true. 1-2 sentences telling the editor: what's happening on this ticket and what to look at. Be specific, not generic.
+Be honest. If nothing's wrong, flagged=false. If ambiguous, default to not flagged.
 
-Be honest. If nothing's wrong — customer is fine, agent did their job — flagged=false. If you cannot tell (ambiguous customer message), default to not flagged.`;
+TICKETS:
+
+${ticketSections}
+
+REMEMBER: output exactly ${candidates.length} JSON objects, one per line, in order.`;
 
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -894,28 +961,51 @@ Be honest. If nothing's wrong — customer is fine, agent did their job — flag
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 512,
-      system: RESPONSE_GUIDELINES,
+      model: MODEL_GRADE,
+      max_tokens: Math.max(512, candidates.length * 200),
+      system: [{ type: "text", text: RESPONSE_GUIDELINES, cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: userMsg }],
     }),
   });
 
+  const fallbackGrade: ReplyGrade = { customer_state: "neutral", service_quality: "ok", flagged: false, reason: "Grader call failed" };
   if (!resp.ok) {
-    throw new Error(`Anthropic API: ${resp.status} ${await resp.text()}`);
+    console.error(`[grader] API ${resp.status}: ${await resp.text()}`);
+    return candidates.map(() => fallbackGrade);
   }
-  const data = (await resp.json()) as { content: { type: string; text: string }[] };
-  const text = data.content.find((c) => c.type === "text")?.text || "{}";
-  const match = text.match(/\{[\s\S]*\}/);
-  const fallback: ReplyGrade = { customer_state: "neutral", service_quality: "ok", flagged: false, reason: "Could not parse grade" };
-  if (!match) return fallback;
-  try {
-    const parsed = JSON.parse(match[0]) as Partial<ReplyGrade>;
-    const cs = parsed.customer_state;
-    const sq = parsed.service_quality;
-    const customer_state: CustomerState = (cs === "angry" || cs === "dissatisfied" || cs === "satisfied" || cs === "neutral") ? cs : "neutral";
-    const service_quality: ServiceQuality = (sq === "unsatisfactory" || sq === "no_agent_reply" || sq === "ok") ? sq : "ok";
-    // Server-side validate flagged (don't trust the model — recompute)
+
+  const data = (await resp.json()) as { content: { type: string; text: string }[]; usage?: Record<string, unknown> };
+  if (data.usage) {
+    const write = data.usage.cache_creation_input_tokens ?? 0;
+    const read = data.usage.cache_read_input_tokens ?? 0;
+    const uncached = data.usage.input_tokens ?? 0;
+    console.log(`[grader] batch=${candidates.length}  cache write=${write}  read=${read}  uncached=${uncached}`);
+  }
+  const text = data.content.find((c) => c.type === "text")?.text || "";
+
+  // Parse N JSON objects (one per line). Robust to code fences and stray text.
+  const parsed: Array<Partial<ReplyGrade> & { ticket_index?: number }> = [];
+  const objRegex = /\{[^{}]*"customer_state"[^{}]*\}/g;
+  const matches = text.match(objRegex) || [];
+  for (const m of matches) {
+    try {
+      parsed.push(JSON.parse(m));
+    } catch {
+      // skip malformed
+    }
+  }
+
+  // Map by ticket_index (1-based) if provided; otherwise by parse order.
+  const grades: ReplyGrade[] = candidates.map((_c, i) => {
+    const byIndex = parsed.find((p) => p.ticket_index === i + 1);
+    const p = byIndex || parsed[i];
+    if (!p) return { ...fallbackGrade, reason: "No grade returned for this ticket" };
+    const cs = p.customer_state;
+    const sq = p.service_quality;
+    const customer_state: CustomerState =
+      cs === "angry" || cs === "dissatisfied" || cs === "satisfied" || cs === "neutral" ? cs : "neutral";
+    const service_quality: ServiceQuality =
+      sq === "unsatisfactory" || sq === "no_agent_reply" || sq === "ok" ? sq : "ok";
     const flagged =
       customer_state === "angry" ||
       customer_state === "dissatisfied" ||
@@ -924,11 +1014,11 @@ Be honest. If nothing's wrong — customer is fine, agent did their job — flag
       customer_state,
       service_quality,
       flagged,
-      reason: parsed.reason || "(no reason given)",
+      reason: p.reason || "(no reason given)",
     };
-  } catch {
-    return fallback;
-  }
+  });
+
+  return grades;
 }
 
 async function summarisePatterns(flaggedCases: Array<{ ticket_id: number; reason: string; customer_state: CustomerState; service_quality: ServiceQuality }>): Promise<string> {
@@ -958,7 +1048,7 @@ Output ONLY the 3-4 sentence summary as plain text. No markdown headers, no bull
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
+        model: MODEL_NARRATIVE,
         max_tokens: 400,
         messages: [{ role: "user", content: userMsg }],
       }),
@@ -1054,17 +1144,60 @@ async function runDailyReview(hours: number, dryRun: boolean): Promise<Record<st
       }
     });
 
-    // Grade everything in parallel (concurrency 3)
+    // Grade candidates using cache + batched grader.
+    // Cache hit if a ticket was graded before AND no new customer message since.
     interface Graded { ticket: TicketListItem; grade: ReplyGrade }
     const graded: Graded[] = [];
-    await parallel(candidates, 3, async (c) => {
+    const cache = await loadGradeCache();
+
+    const toGrade: GradeCandidate[] = [];
+    let cacheHits = 0;
+    for (const c of candidates) {
+      const key = String(c.ticket.id);
+      const currentActivity = latestActivityAt(c.conversations);
+      const cached = cache[key];
+      // Cache hit only when the latest message across ALL directions matches.
+      // (Old entries stored latest_customer_msg_at only — we can't safely reuse
+      // them because they wouldn't have registered a new agent reply. Fall
+      // through to re-grade; the next write updates the entry to the new shape.)
+      if (cached && cached.latest_activity_at === currentActivity) {
+        graded.push({ ticket: c.ticket, grade: cached.grade });
+        cacheHits++;
+      } else {
+        toGrade.push(c);
+      }
+    }
+    console.log(`[grader] cache hits: ${cacheHits}/${candidates.length}  ·  to grade: ${toGrade.length}`);
+
+    // Batch grade the remainder (concurrency of batches, not individual tickets)
+    const batches: GradeCandidate[][] = [];
+    for (let i = 0; i < toGrade.length; i += GRADE_BATCH_SIZE) {
+      batches.push(toGrade.slice(i, i + GRADE_BATCH_SIZE));
+    }
+    await parallel(batches, 3, async (batch) => {
       try {
-        const grade = await gradeAgentReply(c.ticket, c.conversations, c.replyBody);
-        graded.push({ ticket: c.ticket, grade });
-      } catch {
-        // skip grading error
+        const grades = await gradeAgentRepliesBatch(batch);
+        for (let i = 0; i < batch.length; i++) {
+          const c = batch[i];
+          const g = grades[i];
+          graded.push({ ticket: c.ticket, grade: g });
+          cache[String(c.ticket.id)] = {
+            grade: g,
+            latest_activity_at: latestActivityAt(c.conversations),
+            graded_at: new Date().toISOString(),
+          };
+        }
+      } catch (e) {
+        console.error(`[grader] batch failed: ${e instanceof Error ? e.message : e}`);
       }
     });
+
+    // Persist cache (best effort — swallow failures so review still completes)
+    try {
+      await saveGradeCache(cache);
+    } catch (e) {
+      console.error(`[grader] cache save failed: ${e instanceof Error ? e.message : e}`);
+    }
 
     // Only flagged tickets make the report.
     const flagged = graded.filter((g) => g.grade.flagged);

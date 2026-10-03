@@ -1,0 +1,10 @@
+{
+  "name": "md-ayarpadi",
+  "version": "1.0.0",
+  "description": "MD Ayarpadi - 3D study viewer (static single-file page)",
+  "private": true,
+  "scripts": {
+    "start": "bun run server.ts",
+    "dev": "bun --watch run server.ts"
+  }
+}

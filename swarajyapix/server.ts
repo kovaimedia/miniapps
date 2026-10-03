@@ -1,24 +1,10 @@
-import { GoogleGenAI } from "@google/genai";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "fs";
 import { join } from "path";
+import { ai, produceVerified } from "./gemini";
+import { handleMcpRequest } from "./mcp";
+import { getGeneratedImage } from "./imageStore";
 
-// Load .env manually (Bun loads .env automatically, but handle fallback)
-let apiKey = process.env.GOOGLE_API_KEY;
-if (!apiKey) {
-  const fallbackEnv = join(process.env.HOME || "~", ".claude", ".env");
-  if (existsSync(fallbackEnv)) {
-    const content = readFileSync(fallbackEnv, "utf-8");
-    const match = content.match(/GOOGLE_API_KEY=(.+)/);
-    if (match) apiKey = match[1].trim();
-  }
-}
-
-if (!apiKey) {
-  console.error("GOOGLE_API_KEY not found in .env or ~/.claude/.env");
-  process.exit(1);
-}
-
-const ai = new GoogleGenAI({ apiKey });
+const DEFAULT_IMAGE_SIZE = "1K";
 
 // --- Auth: parse AUTH_USERS from env ---
 const authUsers = new Map<string, string>();
@@ -115,10 +101,62 @@ function listBatches(username: string): Omit<BatchRecord, "results">[] {
   return batches.map(({ results, ...rest }) => rest);
 }
 
+// --- MCP: tools: generate_image, edit_image (see ./mcp.ts) ---
+const MCP_SECRET = process.env.MCP_SECRET || "";
+
+function mcpAuthed(req: Request, path: string): boolean {
+  if (!MCP_SECRET) return false;
+  if (path === `/mcp/${MCP_SECRET}`) return true;
+  if (req.headers.get("authorization") === `Bearer ${MCP_SECRET}`) return true;
+  const url = new URL(req.url);
+  return url.searchParams.get("key") === MCP_SECRET;
+}
+
 const server = Bun.serve({
   port: parseInt(process.env.PORT || "3000"),
   async fetch(req) {
     const url = new URL(req.url);
+
+    // --- MCP endpoint (tools: generate_image, edit_image) ---
+    // Only /mcp paths require auth; everything else falls through to the plain
+    // 404 below so OAuth-discovery probes (/.well-known/*, /register) from
+    // connector clients don't trigger a dynamic-registration attempt.
+    if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+      if (!mcpAuthed(req, url.pathname)) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      return handleMcpRequest(req);
+    }
+
+    // --- GET/HEAD /generated/YYYY/MM/DD/<uuid>.ext — fetchable URL for images produced via MCP tools ---
+    // HEAD must answer exactly like GET (same status/headers, no body) — callers that check an image
+    // URL exists before using it (e.g. a posting tool verifying a URL, or the eventual image-host fetch
+    // at publish time) commonly probe with HEAD first.
+    const genMatch = url.pathname.match(/^\/generated\/(\d{4}\/\d{2}\/\d{2}\/[0-9a-f-]{36}\.(?:jpg|png|webp))$/);
+    if (genMatch && (req.method === "GET" || req.method === "HEAD")) {
+      const isHead = req.method === "HEAD";
+      const entry = getGeneratedImage(genMatch[1]);
+
+      if (!entry) {
+        const notFoundBody = "Not found";
+        return new Response(isHead ? null : notFoundBody, {
+          status: 404,
+          headers: {
+            "Content-Type": "text/plain;charset=utf-8",
+            "Content-Length": String(Buffer.byteLength(notFoundBody)),
+          },
+        });
+      }
+
+      return new Response(isHead ? null : entry.buffer, {
+        status: 200,
+        headers: {
+          "Content-Type": entry.mimeType,
+          "Cache-Control": "private, max-age=31536000, immutable",
+          "Content-Length": String(entry.buffer.length),
+        },
+      });
+    }
 
     // Serve index.html at root
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -201,45 +239,17 @@ const server = Bun.serve({
           );
         }
 
-        const imgConfig: Record<string, string> = { aspectRatio };
-        if (imageSize) imgConfig.imageSize = imageSize;
+        const size = imageSize || DEFAULT_IMAGE_SIZE;
 
-        const response = await ai.models.generateContent({
-          model: "gemini-3-pro-image-preview",
-          contents: prompt,
-          config: {
-            responseModalities: ["TEXT", "IMAGE"],
-            imageConfig: imgConfig,
-          },
+        const { result, rounds, unresolved } = await produceVerified(prompt, aspectRatio, size, () => {});
+        return Response.json({
+          image: result.image,
+          mimeType: result.mimeType,
+          prompt,
+          verified: unresolved.length === 0,
+          rounds,
+          problems: unresolved,
         });
-
-        const parts = response.candidates?.[0]?.content?.parts;
-        if (!parts) {
-          return Response.json(
-            { error: "No response from model" },
-            { status: 500 }
-          );
-        }
-
-        for (const part of parts) {
-          if (part.inlineData) {
-            return Response.json({
-              image: part.inlineData.data,
-              mimeType: part.inlineData.mimeType || "image/png",
-              prompt,
-            });
-          }
-        }
-
-        const textPart = parts.find((p: any) => p.text);
-        return Response.json(
-          {
-            error: textPart
-              ? `Model returned text instead of image: ${textPart.text}`
-              : "No image generated",
-          },
-          { status: 500 }
-        );
       } catch (err: any) {
         console.error("Generation error:", err);
         return Response.json(
@@ -329,7 +339,7 @@ const server = Bun.serve({
 
       try {
         const body = await req.json();
-        const { image, mimeType, prompt, aspectRatio = "3:2", imageSize } = body;
+        const { image, mimeType, prompt, aspectRatio = "3:2", imageSize, originalPrompt } = body;
 
         if (!image || !mimeType || !prompt) {
           return Response.json(
@@ -338,53 +348,27 @@ const server = Bun.serve({
           );
         }
 
-        const imgConfig: Record<string, string> = { aspectRatio };
-        if (imageSize) imgConfig.imageSize = imageSize;
+        const size = imageSize || DEFAULT_IMAGE_SIZE;
 
-        const response = await ai.models.generateContent({
-          model: "gemini-3-pro-image-preview",
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { inlineData: { data: image, mimeType } },
-                { text: prompt },
-              ],
-            },
-          ],
-          config: {
-            responseModalities: ["TEXT", "IMAGE"],
-            imageConfig: imgConfig,
-          },
+        // Verify against the full intent (original prompt + this correction), not just the instruction in isolation
+        const requirement = originalPrompt
+          ? `Original request: ${originalPrompt}\nUser correction that MUST be applied: ${prompt}`
+          : prompt;
+
+        const { result, rounds, unresolved } = await produceVerified(requirement, aspectRatio, size, () => {}, {
+          image,
+          mimeType,
+          instruction: prompt,
         });
 
-        const parts = response.candidates?.[0]?.content?.parts;
-        if (!parts) {
-          return Response.json(
-            { error: "No response from model" },
-            { status: 500 }
-          );
-        }
-
-        for (const part of parts) {
-          if (part.inlineData) {
-            return Response.json({
-              image: part.inlineData.data,
-              mimeType: part.inlineData.mimeType || "image/png",
-              prompt,
-            });
-          }
-        }
-
-        const textPart = parts.find((p: any) => p.text);
-        return Response.json(
-          {
-            error: textPart
-              ? `Model returned text instead of image: ${textPart.text}`
-              : "No image generated",
-          },
-          { status: 500 }
-        );
+        return Response.json({
+          image: result.image,
+          mimeType: result.mimeType,
+          prompt,
+          verified: unresolved.length === 0,
+          rounds,
+          problems: unresolved,
+        });
       } catch (err: any) {
         console.error("Edit-image error:", err);
         return Response.json(
@@ -628,3 +612,10 @@ const server = Bun.serve({
 
 console.log(`SwarajyaPix server running at http://localhost:${server.port}`);
 console.log(`Auth users loaded: ${authUsers.size}`);
+
+// Telegram bot runs in the same process when configured
+if (process.env.TELEGRAM_BOT_TOKEN) {
+  import("./bot");
+}
+
+console.log(MCP_SECRET ? "MCP endpoint enabled at /mcp/<secret>" : "MCP_SECRET not set; MCP endpoint disabled");

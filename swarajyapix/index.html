@@ -652,6 +652,12 @@
     color: var(--error);
   }
 
+  .badge-unverified {
+    background: rgba(245,158,11,0.12);
+    color: var(--warning);
+    cursor: help;
+  }
+
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
@@ -1353,6 +1359,8 @@
           results[index].status = 'done';
           results[index].image = data.image;
           results[index].mimeType = data.mimeType || 'image/png';
+          results[index].verified = data.verified;
+          results[index].problems = data.problems;
         }
       } catch (e) {
         results[index].status = 'error';
@@ -1459,6 +1467,14 @@
       statusEl.appendChild(retryBtn);
     }
 
+    if (result.status === 'done' && result.verified === false) {
+      const warnBadge = document.createElement('span');
+      warnBadge.className = 'status-badge badge-unverified';
+      warnBadge.textContent = '⚠ review';
+      warnBadge.title = (result.problems || []).join('; ') || 'AI verifier flagged a possible mismatch with the prompt';
+      statusEl.appendChild(warnBadge);
+    }
+
     body.appendChild(promptEl);
     body.appendChild(statusEl);
     card.appendChild(imageDiv);
@@ -1496,6 +1512,8 @@
         results[index].status = 'done';
         results[index].image = data.image;
         results[index].mimeType = data.mimeType || 'image/png';
+        results[index].verified = data.verified;
+        results[index].problems = data.problems;
       }
     } catch (e) {
       results[index].status = 'error';
@@ -1607,6 +1625,7 @@
           image: r.image,
           mimeType: r.mimeType,
           prompt: editPrompt,
+          originalPrompt: r.prompt,
           aspectRatio: selectedRatio,
           imageSize: selectedResolution,
         }),
@@ -1620,6 +1639,8 @@
       } else {
         results[currentLightboxIndex].image = data.image;
         results[currentLightboxIndex].mimeType = data.mimeType || 'image/png';
+        results[currentLightboxIndex].verified = data.verified;
+        results[currentLightboxIndex].problems = data.problems;
         updateCard(currentLightboxIndex);
         renderLightbox();
         lightboxEditInput.value = '';
@@ -1734,6 +1755,8 @@
           results[index].status = 'done';
           results[index].image = data.image;
           results[index].mimeType = data.mimeType || 'image/png';
+          results[index].verified = data.verified;
+          results[index].problems = data.problems;
         }
       }
     } catch (e) {
