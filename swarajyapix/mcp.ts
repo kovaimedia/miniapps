@@ -7,6 +7,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { z } from "zod";
 import { produceVerified } from "./gemini";
 import { storeGeneratedImage } from "./imageStore";
+import { createBulkJob, setBulkJobItem, getBulkJob, type BulkJobItem } from "./bulkJobStore";
 
 const DEFAULT_ASPECT_RATIO = "3:2";
 const DEFAULT_IMAGE_SIZE = "1K";
@@ -61,12 +62,11 @@ function buildServer(origin: string): McpServer {
     "generate_images",
     {
       description:
-        `Generate up to ${MAX_BULK_PROMPTS} images from a list of text prompts in one call, running them ` +
-        "concurrently server-side instead of one at a time — much faster than calling generate_image in a " +
-        "loop (each image otherwise takes 30-90s including verification, so 10 sequential calls can take " +
-        "10-15 minutes). Each image still goes through the same verify-and-auto-correct check as " +
-        "generate_image. Returns a fetchable URL per image (not inline image data — inlining up to 15 " +
-        "images in one response would be enormous).",
+        `Start generating up to ${MAX_BULK_PROMPTS} images from a list of text prompts. Returns a job id ` +
+        "immediately — it does NOT wait for the images, because a full batch (each image takes 30-90s " +
+        "including verification, so a slow one or two can push the batch past a few minutes) can take " +
+        "longer than a single tool call should block for. Call get_images with the returned jobId to check " +
+        "progress and collect URLs as they finish; call it again later for any still-pending ones.",
       inputSchema: {
         prompts: z
           .array(z.string().min(1))
@@ -81,40 +81,73 @@ function buildServer(origin: string): McpServer {
       const ar = aspectRatio || DEFAULT_ASPECT_RATIO;
       const size = imageSize || DEFAULT_IMAGE_SIZE;
 
-      const results = await Promise.all(
-        prompts.map(
-          (prompt, i) =>
-            new Promise<{ prompt: string; url?: string; verified?: boolean; rounds?: number; problems?: string[]; error?: string }>(
-              (resolve) => {
-                setTimeout(async () => {
-                  try {
-                    const { result, rounds, unresolved } = await produceVerified(prompt, ar, size, () => {});
-                    const relPath = storeGeneratedImage(result.image, result.mimeType);
-                    resolve({
-                      prompt,
-                      url: `${origin}/generated/${relPath}`,
-                      verified: unresolved.length === 0,
-                      rounds,
-                      problems: unresolved,
-                    });
-                  } catch (err: any) {
-                    resolve({ prompt, error: err.message || String(err) });
-                  }
-                }, i * BULK_STAGGER_MS);
-              }
-            )
-        )
-      );
+      const jobId = createBulkJob(prompts);
 
-      const lines = results.map((r, i) => {
-        if (r.error) return `${i + 1}. FAILED — "${r.prompt.slice(0, 60)}" — ${r.error}`;
-        const status = r.verified
-          ? `verified${r.rounds ? ` (auto-corrected ${r.rounds}x)` : ""}`
-          : `flagged: ${(r.problems || []).join("; ")}`;
-        return `${i + 1}. ${status} — ${r.url}`;
+      // Fire and forget: runs after this handler returns. bulkJobStore is module-level
+      // state shared across requests, so a later get_images call (a different HTTP
+      // request, different McpServer instance) still sees updates written here.
+      prompts.forEach((prompt, i) => {
+        setTimeout(async () => {
+          try {
+            const { result, rounds, unresolved } = await produceVerified(prompt, ar, size, () => {});
+            const relPath = storeGeneratedImage(result.image, result.mimeType);
+            setBulkJobItem(jobId, i, {
+              prompt,
+              status: "done",
+              url: `${origin}/generated/${relPath}`,
+              verified: unresolved.length === 0,
+              rounds,
+              problems: unresolved,
+            });
+          } catch (err: any) {
+            setBulkJobItem(jobId, i, { prompt, status: "error", error: err.message || String(err) });
+          }
+        }, i * BULK_STAGGER_MS);
       });
 
-      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Started job ${jobId} for ${prompts.length} image(s). Call get_images with jobId "${jobId}" ` +
+              "in a little while to check progress and get URLs as they finish.",
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "get_images",
+    {
+      description:
+        "Check progress on a job started by generate_images and collect whichever images are done so far. " +
+        "Safe to call repeatedly — call it again later for prompts still pending.",
+      inputSchema: {
+        jobId: z.string().min(1).describe("The job id returned by generate_images"),
+      },
+    },
+    async ({ jobId }) => {
+      const items = getBulkJob(jobId);
+      if (!items) {
+        return {
+          content: [{ type: "text" as const, text: `No such job: ${jobId} (it may have expired).` }],
+          isError: true,
+        };
+      }
+
+      const done = items.filter((i: BulkJobItem) => i.status !== "pending").length;
+      const lines = items.map((item: BulkJobItem, i: number) => {
+        if (item.status === "pending") return `${i + 1}. pending — "${item.prompt.slice(0, 60)}"`;
+        if (item.status === "error") return `${i + 1}. FAILED — "${item.prompt.slice(0, 60)}" — ${item.error}`;
+        const status = item.verified
+          ? `verified${item.rounds ? ` (auto-corrected ${item.rounds}x)` : ""}`
+          : `flagged: ${(item.problems || []).join("; ")}`;
+        return `${i + 1}. ${status} — ${item.url}`;
+      });
+
+      return { content: [{ type: "text" as const, text: `${done}/${items.length} done.\n${lines.join("\n")}` }] };
     }
   );
 
